@@ -14,7 +14,10 @@
 
 use crate::compiler::args::*;
 use crate::compiler::c::{ArtifactDescriptor, CCompilerImpl, CCompilerKind, ParsedArguments};
-use crate::compiler::{clang, Cacheable, ColorMode, CompileCommand, CompilerArguments, Language};
+use crate::compiler::{
+    clang, CCompileCommand, Cacheable, ColorMode, CompileCommand, CompilerArguments, Language,
+    SingleCompileCommand,
+};
 use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::{run_input_output, OsStrExt};
 use crate::{counted_array, dist};
@@ -91,7 +94,7 @@ impl CCompilerImpl for Gcc {
         .await
     }
 
-    fn generate_compile_commands(
+    fn generate_compile_commands<T>(
         &self,
         path_transformer: &mut dist::PathTransformer,
         executable: &Path,
@@ -99,7 +102,14 @@ impl CCompilerImpl for Gcc {
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
         rewrite_includes_only: bool,
-    ) -> Result<(CompileCommand, Option<dist::CompileCommand>, Cacheable)> {
+    ) -> Result<(
+        Box<dyn CompileCommand<T>>,
+        Option<dist::CompileCommand>,
+        Cacheable,
+    )>
+    where
+        T: CommandCreatorSync,
+    {
         generate_compile_commands(
             path_transformer,
             executable,
@@ -109,6 +119,9 @@ impl CCompilerImpl for Gcc {
             self.kind(),
             rewrite_includes_only,
         )
+        .map(|(command, dist_command, cacheable)| {
+            (CCompileCommand::new(command), dist_command, cacheable)
+        })
     }
 }
 
@@ -127,6 +140,7 @@ ArgData! { pub
     PreprocessorArgument(OsString),
     PreprocessorArgumentPath(PathBuf),
     // Used for arguments that shouldn't affect the computed hash
+    UnhashedFlag,
     Unhashed(OsString),
     DoCompilation,
     Output(PathBuf),
@@ -378,6 +392,7 @@ where
             | Some(PreprocessorArgumentPath(_))
             | Some(PassThrough(_))
             | Some(PassThroughPath(_))
+            | Some(UnhashedFlag)
             | Some(Unhashed(_)) => {}
             Some(Language(lang)) => {
                 language = match lang.to_string_lossy().as_ref() {
@@ -437,7 +452,7 @@ where
             | Some(PassThroughFlag)
             | Some(PassThrough(_))
             | Some(PassThroughPath(_)) => &mut common_args,
-            Some(Unhashed(_)) => &mut unhashed_args,
+            Some(UnhashedFlag) | Some(Unhashed(_)) => &mut unhashed_args,
             Some(Arch(_)) => &mut arch_args,
             Some(ExtraHashFile(path)) => {
                 extra_hash_files.push(cwd.join(path));
@@ -520,7 +535,7 @@ where
             | Some(PassThroughFlag)
             | Some(PassThroughPath(_))
             | Some(SerializeDiagnostics(_)) => &mut common_args,
-            Some(Unhashed(_)) => &mut unhashed_args,
+            Some(UnhashedFlag) | Some(Unhashed(_)) => &mut unhashed_args,
             Some(ExtraHashFile(path)) => {
                 extra_hash_files.push(cwd.join(path));
                 &mut common_args
@@ -661,6 +676,7 @@ where
         common_args,
         arch_args,
         unhashed_args,
+        extra_dist_files: vec![],
         extra_hash_files,
         msvc_show_includes: false,
         profile_generate,
@@ -670,7 +686,7 @@ where
     })
 }
 
-fn language_to_gcc_arg(lang: Language) -> Option<&'static str> {
+pub fn language_to_gcc_arg(lang: Language) -> Option<&'static str> {
     match lang {
         Language::C => Some("c"),
         Language::CHeader => Some("c-header"),
@@ -679,6 +695,8 @@ fn language_to_gcc_arg(lang: Language) -> Option<&'static str> {
         Language::ObjectiveC => Some("objective-c"),
         Language::ObjectiveCxx => Some("objective-c++"),
         Language::Cuda => Some("cu"),
+        Language::Ptx => None,
+        Language::Cubin => None,
         Language::Rust => None, // Let the compiler decide
         Language::Hip => Some("hip"),
         Language::GenericHeader => None, // Let the compiler decide
@@ -731,7 +749,6 @@ fn preprocess_cmd<T>(
     // Explicitly rewrite the -arch args to be preprocessor defines of the form
     // __arch__ so that they affect the preprocessor output but don't cause
     // clang to error.
-    debug!("arch args before rewrite: {:?}", parsed_args.arch_args);
     let rewritten_arch_args = parsed_args
         .arch_args
         .iter()
@@ -749,6 +766,9 @@ fn preprocess_cmd<T>(
     if unique_rewritten.len() <= 1 {
         // don't use rewritten arch args if there is only one arch
         arch_args_to_use = &parsed_args.arch_args;
+    } else {
+        debug!("-arch args before rewrite: {:?}", parsed_args.arch_args);
+        debug!("-arch args after rewrite:  {:?}", arch_args_to_use);
     }
 
     cmd.args(&parsed_args.preprocessor_args)
@@ -762,7 +782,6 @@ fn preprocess_cmd<T>(
         .env_clear()
         .envs(env_vars.to_vec())
         .current_dir(cwd);
-    debug!("cmd after -arch rewrite: {:?}", cmd);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -806,7 +825,11 @@ pub fn generate_compile_commands(
     env_vars: &[(OsString, OsString)],
     kind: CCompilerKind,
     rewrite_includes_only: bool,
-) -> Result<(CompileCommand, Option<dist::CompileCommand>, Cacheable)> {
+) -> Result<(
+    SingleCompileCommand,
+    Option<dist::CompileCommand>,
+    Cacheable,
+)> {
     // Unused arguments
     #[cfg(not(feature = "dist-client"))]
     {
@@ -843,7 +866,7 @@ pub fn generate_compile_commands(
         arguments.push("--".into());
     }
     arguments.push(parsed_args.input.clone().into());
-    let command = CompileCommand {
+    let command = SingleCompileCommand {
         executable: executable.to_owned(),
         arguments,
         env_vars: env_vars.to_owned(),
@@ -984,6 +1007,8 @@ mod test {
     use super::*;
     use crate::compiler::*;
     use crate::mock_command::*;
+    use crate::server;
+    use crate::test::mock_storage::MockStorage;
     use crate::test::utils::*;
 
     use temp_env::{with_var, with_var_unset};
@@ -2117,6 +2142,7 @@ mod test {
             common_args: vec![],
             arch_args: vec![],
             unhashed_args: vec![],
+            extra_dist_files: vec![],
             extra_hash_files: vec![],
             msvc_show_includes: false,
             profile_generate: false,
@@ -2124,6 +2150,10 @@ mod test {
             suppress_rewrite_includes_only: false,
             too_hard_for_preprocessor_cache_mode: None,
         };
+        let runtime = single_threaded_runtime();
+        let storage = MockStorage::new(None, false);
+        let storage: std::sync::Arc<MockStorage> = std::sync::Arc::new(storage);
+        let service = server::SccacheService::mock_with_storage(storage, runtime.handle().clone());
         let compiler = &f.bins[0];
         // Compiler invocation.
         next_command(&creator, Ok(MockChild::new(exit_status(0), "", "")));
@@ -2142,7 +2172,7 @@ mod test {
         assert!(dist_command.is_some());
         #[cfg(not(feature = "dist-client"))]
         assert!(dist_command.is_none());
-        let _ = command.execute(&creator).wait();
+        let _ = command.execute(&service, &creator).wait();
         assert_eq!(Cacheable::Yes, cacheable);
         // Ensure that we ran all processes.
         assert_eq!(0, creator.lock().unwrap().children.len());
@@ -2169,7 +2199,7 @@ mod test {
         )
         .unwrap();
         let expected_args = ovec!["-x", "c", "-c", "-o", "foo.o", "--", "foo.c"];
-        assert_eq!(command.arguments, expected_args);
+        assert_eq!(command.get_arguments(), expected_args);
     }
 
     #[test]
