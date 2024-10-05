@@ -514,8 +514,14 @@ impl<'a> Deserialize<'a> for DistAuth {
 
 impl Default for DistAuth {
     fn default() -> Self {
+        let token = if let Ok(token) = env::var("SCCACHE_DIST_AUTH_TOKEN") {
+            token
+        } else {
+            INSECURE_DIST_CLIENT_TOKEN.to_owned()
+        };
+
         DistAuth::Token {
-            token: INSECURE_DIST_CLIENT_TOKEN.to_owned(),
+            token,
         }
     }
 }
@@ -537,9 +543,19 @@ pub struct DistConfig {
 
 impl Default for DistConfig {
     fn default() -> Self {
+        let scheduler_url = if let Ok(scheduler_url) = env::var("SCCACHE_DIST_SCHEDULER_URL") {
+            Some(
+                parse_http_url(&scheduler_url)
+                    .map(|url| HTTPUrl::from_url(url))
+                    .expect("Scheduler url must be valid url str"),
+            )
+        } else {
+            Default::default()
+        };
+
         Self {
             auth: Default::default(),
-            scheduler_url: Default::default(),
+            scheduler_url,
             cache_dir: default_dist_cache_dir(),
             toolchains: Default::default(),
             toolchain_cache_size: default_toolchain_cache_size(),
